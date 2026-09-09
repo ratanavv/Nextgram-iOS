@@ -51,7 +51,7 @@ jobs:
       - name: Configure re-signable build
         run: |
           cat > local.bazelrc <<'EOF'
-          build --//Telegram:disableExtensions
+          build
           EOF
 
       - name: Write build configuration
