@@ -143,24 +143,74 @@ jobs:
           CODESIGNING_PATH="${GITHUB_WORKSPACE}/build-input/nextgram-trollstore-codesigning"
           PROFILE_DIR="${CODESIGNING_PATH}/profiles"
           CERT_DIR="${CODESIGNING_PATH}/certs"
+          SOURCE_PROFILE_DIR="${GITHUB_WORKSPACE}/build-system/fake-codesigning/profiles"
 
           mkdir -p "${PROFILE_DIR}" "${CERT_DIR}"
           cp build-system/fake-codesigning/certs/* "${CERT_DIR}/"
 
-          python3 - "${PROFILE_DIR}" "${BUNDLE_ID}" <<'PY'
+          # GitHub macOS images may provide an OpenSSL build that does not
+          # support the "-legacy" PKCS#12 option. Do not use openssl for the
+          # PKCS#12/profile operation here. macOS "security" can import the
+          # repository's fake certificate and CMS-sign the profiles directly.
+          KEYCHAIN_PATH="${RUNNER_TEMP}/nextgram-profile.keychain-db"
+          KEYCHAIN_PASSWORD="$(python3 - <<'PY'
+          import secrets
+          print(secrets.token_urlsafe(24))
+          PY
+          )"
+
+          security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+          security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+          security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+
+          security import \
+            "${CERT_DIR}/SelfSigned.p12" \
+            -k "${KEYCHAIN_PATH}" \
+            -P "" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "${KEYCHAIN_PASSWORD}" \
+            "${KEYCHAIN_PATH}"
+
+          security list-keychain -d user -s "${KEYCHAIN_PATH}"
+
+          IDENTITY="$(
+            security find-identity -v -p codesigning "${KEYCHAIN_PATH}" |
+              awk -F '"' '/^[[:space:]]*[0-9]+\)/ { print $2; exit }'
+          )"
+
+          if [[ -z "${IDENTITY}" ]]; then
+            echo "::error::Could not find a codesigning identity in SelfSigned.p12"
+            security find-identity -v -p codesigning "${KEYCHAIN_PATH}" || true
+            exit 1
+          fi
+
+          echo "Using fake signing identity: ${IDENTITY}"
+
+          cleanup() {
+            security delete-keychain "${KEYCHAIN_PATH}" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          export SOURCE_PROFILE_DIR PROFILE_DIR BUNDLE_ID IDENTITY KEYCHAIN_PATH
+
+          python3 <<'PY'
+          import os
           import plistlib
           import subprocess
-          import sys
           import tempfile
           from pathlib import Path
 
-          profile_dir = Path(sys.argv[1])
-          bundle_id = sys.argv[2]
-          source_dir = Path("build-system/fake-codesigning/profiles")
-          cert_dir = Path("build-system/fake-codesigning/certs")
-          p12 = cert_dir / "SelfSigned.p12"
+          source_dir = Path(os.environ["SOURCE_PROFILE_DIR"])
+          output_dir = Path(os.environ["PROFILE_DIR"])
+          bundle_id = os.environ["BUNDLE_ID"]
+          identity = os.environ["IDENTITY"]
+          keychain = os.environ["KEYCHAIN_PATH"]
 
-          profile_names = [
+          names = [
               "Telegram.mobileprovision",
               "Share.mobileprovision",
               "NotificationContent.mobileprovision",
@@ -181,78 +231,65 @@ jobs:
                   return {k: replace(v) for k, v in value.items()}
               return value
 
-          with tempfile.TemporaryDirectory() as td:
-              td = Path(td)
+          for name in names:
+              src = source_dir / name
+              dst = output_dir / name
 
-              pem = td / "signing.pem"
-              subprocess.run(
-                  [
-                      "openssl", "pkcs12",
-                      "-in", str(p12),
-                      "-passin", "pass:",
-                      "-nodes", "-legacy",
-                      "-out", str(pem),
-                  ],
-                  check=True,
-              )
+              with tempfile.TemporaryDirectory() as td:
+                  td = Path(td)
+                  plist_path = td / "profile.plist"
 
-              for name in profile_names:
-                  src = source_dir / name
-                  raw_plist = td / name.replace(".mobileprovision", ".plist")
-
+                  # Decode the existing CMS profile with Apple's security tool.
                   subprocess.run(
                       [
-                          "openssl", "smime",
-                          "-inform", "der",
-                          "-verify", "-noverify",
-                          "-in", str(src),
-                          "-out", str(raw_plist),
+                          "security", "cms",
+                          "-D",
+                          "-i", str(src),
+                          "-o", str(plist_path),
                       ],
                       check=True,
                   )
 
-                  with raw_plist.open("rb") as f:
+                  with plist_path.open("rb") as f:
                       profile = plistlib.load(f)
 
-                  profile.pop("DER-Encoded-Profile", None)
                   profile = replace(profile)
+                  profile.pop("DER-Encoded-Profile", None)
 
                   ent = profile.get("Entitlements", {})
-                  expected_app_id = ent.get("application-identifier", "")
-                  expected_team = ent.get("com.apple.developer.team-identifier", "")
+                  team = ent.get("com.apple.developer.team-identifier", "")
+                  app_id = ent.get("application-identifier", "")
 
-                  if not expected_team.startswith("C67CF9S4VU"):
+                  if team != "C67CF9S4VU":
                       raise SystemExit(
-                          f"{name}: unexpected team identifier: {expected_team!r}"
+                          f"{name}: unexpected team identifier: {team!r}"
                       )
 
-                  if not expected_app_id.startswith("C67CF9S4VU." + bundle_id):
+                  if not app_id.startswith("C67CF9S4VU." + bundle_id):
                       raise SystemExit(
-                          f"{name}: unexpected application-identifier: {expected_app_id!r}"
+                          f"{name}: unexpected application-identifier: {app_id!r}"
                       )
 
-                  with raw_plist.open("wb") as f:
+                  with plist_path.open("wb") as f:
                       plistlib.dump(profile, f, sort_keys=False)
 
-                  dst = profile_dir / name
-
+                  # Re-sign the modified plist as a CMS provisioning profile.
                   subprocess.run(
                       [
-                          "openssl", "smime",
-                          "-sign", "-binary", "-nodetach",
-                          "-outform", "der",
-                          "-in", str(raw_plist),
-                          "-signer", str(pem),
-                          "-inkey", str(pem),
-                          "-out", str(dst),
+                          "security", "cms",
+                          "-S",
+                          "-k", keychain,
+                          "-N", identity,
+                          "-i", str(plist_path),
+                          "-o", str(dst),
                       ],
                       check=True,
                   )
 
-                  print(f"Generated {dst}")
+              print(f"Generated {dst}")
 
           print("Generated profiles:")
-          for p in sorted(profile_dir.glob("*.mobileprovision")):
+          for p in sorted(output_dir.glob("*.mobileprovision")):
               print(" -", p.name)
           PY
 
