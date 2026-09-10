@@ -1,0 +1,487 @@
+name: Build Nextgram TrollStore IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nextgram-trollstore-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Apple Silicon macOS runner with Xcode available.
+    # Pin this if you want completely reproducible runner behavior.
+    runs-on: macos-15
+    timeout-minutes: 240
+
+    env:
+      LANG: en_US.UTF-8
+      LC_ALL: en_US.UTF-8
+      BUNDLE_ID: jp.foxtea.nextgram
+      TEAM_ID: C67CF9S4VU
+      TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+      TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+
+    steps:
+      - name: Check out source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Prefer Xcode 26 when present, otherwise use the runner's selected Xcode.
+          XC="$(find /Applications -maxdepth 1 -type d \
+            -name 'Xcode_26*.app' -print 2>/dev/null | sort -V | tail -1 || true)"
+
+          if [[ -n "${XC}" ]]; then
+            sudo xcode-select -s "${XC}/Contents/Developer"
+          fi
+
+          xcode-select -p
+          xcodebuild -version
+          swift --version
+
+      - name: Install Metal toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Validate API credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TELEGRAM_API_ID}" || -z "${TELEGRAM_API_HASH}" ]]; then
+            echo "::error::Create TELEGRAM_API_ID and TELEGRAM_API_HASH repository secrets."
+            exit 1
+          fi
+
+          if [[ ! "${TELEGRAM_API_ID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::TELEGRAM_API_ID must be numeric."
+            exit 1
+          fi
+
+      - name: Cache Bazel downloads and outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/telegram-bazel-cache
+            ~/.cache/bazel
+          key: nextgram-trollstore-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('versions.json', 'MODULE.bazel.lock') }}
+          restore-keys: |
+            nextgram-trollstore-${{ runner.os }}-${{ runner.arch }}-
+            nextgram-trollstore-${{ runner.os }}-
+
+      - name: Configure Bazel
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # IMPORTANT:
+          # Do NOT set --//Telegram:disableExtensions.
+          # Do NOT set --//Telegram:disableProvisioningProfiles.
+          #
+          # This build intentionally includes:
+          # Share, NotificationContent, NotificationService,
+          # Siri Intents, Widget and BroadcastUpload extensions.
+
+          cat > local.bazelrc <<'EOF'
+          build --features=no_include_scanning
+          build --host_features=no_include_scanning
+          build --copt=-Wno-deprecated-declarations
+          build --@build_bazel_rules_swift//swift:copt=-no-warnings-as-errors
+          EOF
+
+      - name: Write Nextgram build configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p build-input
+
+          cat > build-input/nextgram-trollstore.json <<JSON
+          {
+            "bundle_id": "${BUNDLE_ID}",
+            "api_id": "${TELEGRAM_API_ID}",
+            "api_hash": "${TELEGRAM_API_HASH}",
+            "team_id": "${TEAM_ID}",
+            "app_center_id": "0",
+            "is_internal_build": "true",
+            "is_appstore_build": "false",
+            "appstore_id": "0",
+            "app_specific_url_scheme": "nextgram",
+            "premium_iap_product_id": "",
+            "enable_siri": false,
+            "enable_icloud": false
+          }
+          JSON
+
+      - name: Import disposable signing certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 build-system/Make/ImportCertificates.py \
+            --path build-system/fake-codesigning/certs
+
+      - name: Generate all extension provisioning profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CODESIGNING_PATH="${GITHUB_WORKSPACE}/build-input/nextgram-trollstore-codesigning"
+          PROFILE_DIR="${CODESIGNING_PATH}/profiles"
+          CERT_DIR="${CODESIGNING_PATH}/certs"
+
+          mkdir -p "${PROFILE_DIR}" "${CERT_DIR}"
+          cp build-system/fake-codesigning/certs/* "${CERT_DIR}/"
+
+          python3 - "${PROFILE_DIR}" "${BUNDLE_ID}" <<'PY'
+          import plistlib
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          profile_dir = Path(sys.argv[1])
+          bundle_id = sys.argv[2]
+          source_dir = Path("build-system/fake-codesigning/profiles")
+          cert_dir = Path("build-system/fake-codesigning/certs")
+          p12 = cert_dir / "SelfSigned.p12"
+
+          profile_names = [
+              "Telegram.mobileprovision",
+              "Share.mobileprovision",
+              "NotificationContent.mobileprovision",
+              "NotificationService.mobileprovision",
+              "Intents.mobileprovision",
+              "Widget.mobileprovision",
+              "BroadcastUpload.mobileprovision",
+          ]
+
+          old_bundle_id = "ph.telegra.Telegraph"
+
+          def replace(value):
+              if isinstance(value, str):
+                  return value.replace(old_bundle_id, bundle_id)
+              if isinstance(value, list):
+                  return [replace(v) for v in value]
+              if isinstance(value, dict):
+                  return {k: replace(v) for k, v in value.items()}
+              return value
+
+          with tempfile.TemporaryDirectory() as td:
+              td = Path(td)
+
+              pem = td / "signing.pem"
+              subprocess.run(
+                  [
+                      "openssl", "pkcs12",
+                      "-in", str(p12),
+                      "-passin", "pass:",
+                      "-nodes", "-legacy",
+                      "-out", str(pem),
+                  ],
+                  check=True,
+              )
+
+              for name in profile_names:
+                  src = source_dir / name
+                  raw_plist = td / name.replace(".mobileprovision", ".plist")
+
+                  subprocess.run(
+                      [
+                          "openssl", "smime",
+                          "-inform", "der",
+                          "-verify", "-noverify",
+                          "-in", str(src),
+                          "-out", str(raw_plist),
+                      ],
+                      check=True,
+                  )
+
+                  with raw_plist.open("rb") as f:
+                      profile = plistlib.load(f)
+
+                  profile.pop("DER-Encoded-Profile", None)
+                  profile = replace(profile)
+
+                  ent = profile.get("Entitlements", {})
+                  expected_app_id = ent.get("application-identifier", "")
+                  expected_team = ent.get("com.apple.developer.team-identifier", "")
+
+                  if not expected_team.startswith("C67CF9S4VU"):
+                      raise SystemExit(
+                          f"{name}: unexpected team identifier: {expected_team!r}"
+                      )
+
+                  if not expected_app_id.startswith("C67CF9S4VU." + bundle_id):
+                      raise SystemExit(
+                          f"{name}: unexpected application-identifier: {expected_app_id!r}"
+                      )
+
+                  with raw_plist.open("wb") as f:
+                      plistlib.dump(profile, f, sort_keys=False)
+
+                  dst = profile_dir / name
+
+                  subprocess.run(
+                      [
+                          "openssl", "smime",
+                          "-sign", "-binary", "-nodetach",
+                          "-outform", "der",
+                          "-in", str(raw_plist),
+                          "-signer", str(pem),
+                          "-inkey", str(pem),
+                          "-out", str(dst),
+                      ],
+                      check=True,
+                  )
+
+                  print(f"Generated {dst}")
+
+          print("Generated profiles:")
+          for p in sorted(profile_dir.glob("*.mobileprovision")):
+              print(" -", p.name)
+          PY
+
+      - name: Verify generated provisioning profiles
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for profile in \
+            Telegram \
+            Share \
+            NotificationContent \
+            NotificationService \
+            Intents \
+            Widget \
+            BroadcastUpload
+          do
+            test -f "build-input/nextgram-trollstore-codesigning/profiles/${profile}.mobileprovision"
+
+            tmp="$(mktemp)"
+            openssl smime -inform der -verify -noverify \
+              -in "build-input/nextgram-trollstore-codesigning/profiles/${profile}.mobileprovision" \
+              -out "${tmp}"
+
+            python3 - "${tmp}" "${profile}" "${BUNDLE_ID}" <<'PY'
+          import plistlib
+          import sys
+
+          path, name, bundle_id = sys.argv[1:]
+          with open(path, "rb") as f:
+              p = plistlib.load(f)
+
+          ent = p["Entitlements"]
+          team = ent.get("com.apple.developer.team-identifier")
+          app_id = ent.get("application-identifier")
+
+          assert team == "C67CF9S4VU", (name, team)
+          assert app_id.startswith("C67CF9S4VU." + bundle_id), (name, app_id)
+
+          print(name, "OK:", app_id)
+          PY
+
+            rm -f "${tmp}"
+          done
+
+      - name: Build arm64 IPA with all extensions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OFFSET=0
+          if [[ -f build_number_offset ]]; then
+            OFFSET="$(cat build_number_offset)"
+          fi
+
+          BUILD_NUMBER="$(( $(git rev-list --count HEAD) + OFFSET ))"
+
+          echo "Build number: ${BUILD_NUMBER}"
+          echo "Bundle ID: ${BUNDLE_ID}"
+          echo "Architecture: arm64"
+
+          python3 build-system/Make/Make.py \
+            --overrideXcodeVersion \
+            --cacheDir "$HOME/telegram-bazel-cache" \
+            build \
+            --configurationPath build-input/nextgram-trollstore.json \
+            --codesigningInformationPath build-input/nextgram-trollstore-codesigning \
+            --buildNumber "${BUILD_NUMBER}" \
+            --configuration release_arm64
+
+      - name: Verify built IPA contains all six extensions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IPA="bazel-bin/Telegram/Telegram.ipa"
+          test -f "${IPA}"
+
+          rm -rf build/verify-ipa
+          mkdir -p build/verify-ipa
+          ditto -x -k "${IPA}" build/verify-ipa
+
+          APP="$(find build/verify-ipa/Payload -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "${APP}"
+
+          MAIN_ID="$(plutil -extract CFBundleIdentifier raw "${APP}/Info.plist")"
+          test "${MAIN_ID}" = "${BUNDLE_ID}"
+
+          echo "Main bundle: ${MAIN_ID}"
+
+          # Directory name -> expected CFBundleIdentifier.
+          declare -A EXT_IDS=(
+            ["Share.appex"]="${BUNDLE_ID}.Share"
+            ["NotificationContent.appex"]="${BUNDLE_ID}.NotificationContent"
+            ["NotificationService.appex"]="${BUNDLE_ID}.NotificationService"
+            ["Intents.appex"]="${BUNDLE_ID}.SiriIntents"
+            ["Widget.appex"]="${BUNDLE_ID}.Widget"
+            ["BroadcastUpload.appex"]="${BUNDLE_ID}.BroadcastUpload"
+          )
+
+          for ext in "${!EXT_IDS[@]}"; do
+            path="${APP}/PlugIns/${ext}"
+            expected="${EXT_IDS[$ext]}"
+
+            if [[ ! -d "${path}" ]]; then
+              echo "::error::Missing extension: ${ext}"
+              exit 1
+            fi
+
+            actual="$(plutil -extract CFBundleIdentifier raw "${path}/Info.plist")"
+
+            if [[ "${actual}" != "${expected}" ]]; then
+              echo "::error::Wrong bundle ID for ${ext}: ${actual}; expected ${expected}"
+              exit 1
+            fi
+
+            echo "Verified ${ext}: ${actual}"
+          done
+
+      - name: Create TrollStore-ready IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf build/package build/artifacts
+          mkdir -p build/package build/artifacts
+
+          ditto -x -k bazel-bin/Telegram/Telegram.ipa build/package
+
+          APP="$(find build/package/Payload -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "${APP}"
+
+          # Remove normal Apple code signatures and embedded provisioning
+          # profiles so the IPA is re-signable/installable through TrollStore.
+          find "${APP}" -type d -name _CodeSignature -prune -exec rm -rf {} +
+          find "${APP}" -name embedded.mobileprovision -delete
+
+          # Re-check that all six extensions survived stripping.
+          for ext in \
+            Share.appex \
+            NotificationContent.appex \
+            NotificationService.appex \
+            Intents.appex \
+            Widget.appex \
+            BroadcastUpload.appex
+          do
+            test -d "${APP}/PlugIns/${ext}"
+          done
+
+          (
+            cd build/package
+            /usr/bin/zip -qry ../artifacts/Nextgram-TrollStore.ipa Payload
+          )
+
+          ls -lh build/artifacts/Nextgram-TrollStore.ipa
+
+      - name: Final IPA verification
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IPA="build/artifacts/Nextgram-TrollStore.ipa"
+          rm -rf build/final-verify
+          mkdir -p build/final-verify
+
+          ditto -x -k "${IPA}" build/final-verify
+
+          APP="$(find build/final-verify/Payload -maxdepth 1 -type d -name '*.app' -print -quit)"
+          test -n "${APP}"
+
+          test "$(plutil -extract CFBundleIdentifier raw "${APP}/Info.plist")" = "${BUNDLE_ID}"
+
+          for ext in \
+            Share.appex \
+            NotificationContent.appex \
+            NotificationService.appex \
+            Intents.appex \
+            Widget.appex \
+            BroadcastUpload.appex
+          do
+            test -d "${APP}/PlugIns/${ext}"
+            if find "${APP}/PlugIns/${ext}" -type f -name embedded.mobileprovision | grep -q .; then
+              echo "::error::embedded.mobileprovision remains in ${ext}"
+              exit 1
+            fi
+          done
+
+          echo "Final IPA verification passed."
+
+      - name: Upload TrollStore IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nextgram-TrollStore-${{ github.sha }}
+          path: build/artifacts/Nextgram-TrollStore.ipa
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload dSYMs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Nextgram-dSYMs-${{ github.sha }}
+          path: |
+            bazel-bin/Telegram/*.dSYM
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Publish TrollStore IPA to GitHub Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="$(TZ=UTC date +%Y%m%d)-${GITHUB_RUN_NUMBER}"
+
+          if gh release view "${VERSION}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload \
+              "${VERSION}" \
+              build/artifacts/Nextgram-TrollStore.ipa \
+              --clobber \
+              --repo "${GITHUB_REPOSITORY}"
+          else
+            gh release create \
+              "${VERSION}" \
+              build/artifacts/Nextgram-TrollStore.ipa \
+              --repo "${GITHUB_REPOSITORY}" \
+              --target "${GITHUB_SHA}" \
+              --title "${VERSION}" \
+              --notes "Nextgram TrollStore-ready IPA. Bundle ID: ${BUNDLE_ID}. Includes all six iOS extensions."
+          fi
