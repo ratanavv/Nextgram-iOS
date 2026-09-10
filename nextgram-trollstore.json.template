@@ -1,0 +1,14 @@
+{
+  "bundle_id": "jp.foxtea.nextgram",
+  "api_id": "REPLACE_WITH_TELEGRAM_API_ID",
+  "api_hash": "REPLACE_WITH_TELEGRAM_API_HASH",
+  "team_id": "C67CF9S4VU",
+  "app_center_id": "0",
+  "is_internal_build": "true",
+  "is_appstore_build": "false",
+  "appstore_id": "0",
+  "app_specific_url_scheme": "nextgram",
+  "premium_iap_product_id": "",
+  "enable_siri": false,
+  "enable_icloud": false
+}
